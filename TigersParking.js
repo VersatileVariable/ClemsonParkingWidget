@@ -9,19 +9,14 @@ const DEFAULT_CHART_LOT_ID = 4; // C-03 fallback when no lots are loaded
 const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 const C_LOTS = {
-  2:   "C-01",
-  4:   "C-03",
-  5:   "C-07",
-  6:   "C-09",
-  7:   "C-11",
-  25:  "C-15",
-  56:  "C-01 Ext",
-  57:  "C-04",
-  87:  "P-05",
-  198: "P-04",
-  202: "P-06",
-  203: "P-07",
-  204: "P-08",
+  2:  "C-01",
+  4:  "C-03",
+  5:  "C-07",
+  6:  "C-09",
+  7:  "C-11",
+  25: "C-15",
+  56: "C-01 Ext",
+  57: "C-04",
 };
 
 // ── Palette — muted, low saturation ─────────────────
