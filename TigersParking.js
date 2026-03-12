@@ -1,10 +1,12 @@
 // Tigers Parking — Scriptable Widget
 // Large widget · Commuter lots · iPhone
 
-const API_URL = "https://www.tigerscommute.com/api/ElevenX/ZonesOccupancyStatus";
-const CACHE_KEY = "tigers_parking_history";
-const MAX_HISTORY = 288;
+const API_URL     = "https://www.tigerscommute.com/api/ElevenX/ZonesOccupancyStatus";
+const ARCHIVE_KEY = "tigers_parking_archive";  // All historical snapshots (unbounded)
+const WEEKLY_KEY  = "tigers_parking_weekly";   // Running averages by day-of-week + time slot
 const DEFAULT_CHART_LOT_ID = 4; // C-03 fallback when no lots are loaded
+
+const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 const C_LOTS = {
   2:   "C-01",
@@ -54,32 +56,97 @@ function fmtTime(d) {
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-// ── Cache ────────────────────────────────────────────
-function loadHistory() {
+// Returns the 5-minute slot index (0–287) for a given timestamp
+function timeSlotOf(ts) {
+  const d = new Date(ts);
+  return Math.floor((d.getHours() * 60 + d.getMinutes()) / 5);
+}
+
+// Returns midnight timestamp for the day containing ts
+function startOfDay(ts) {
+  const d = new Date(ts);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+// ── Archive (all historical snapshots, never trimmed) ─
+function loadArchive() {
   const fm = FileManager.local();
-  const path = fm.joinPath(fm.documentsDirectory(), CACHE_KEY + ".json");
+  const path = fm.joinPath(fm.documentsDirectory(), ARCHIVE_KEY + ".json");
   if (!fm.fileExists(path)) return [];
   try { return JSON.parse(fm.readString(path)); }
   catch { return []; }
 }
 
-function saveHistory(history) {
+function saveArchive(archive) {
   const fm = FileManager.local();
-  const path = fm.joinPath(fm.documentsDirectory(), CACHE_KEY + ".json");
-  fm.writeString(path, JSON.stringify(history));
+  const path = fm.joinPath(fm.documentsDirectory(), ARCHIVE_KEY + ".json");
+  fm.writeString(path, JSON.stringify(archive));
+}
+
+// Filter archive to snapshots taken today (since midnight)
+function getTodayHistory(archive) {
+  const todayStart = startOfDay(Date.now());
+  return archive.filter(s => s.ts >= todayStart);
+}
+
+// ── Weekly Trends (running avg per day-of-week + time slot + zone) ──
+function loadWeeklyTrends() {
+  const fm = FileManager.local();
+  const path = fm.joinPath(fm.documentsDirectory(), WEEKLY_KEY + ".json");
+  if (!fm.fileExists(path)) return {};
+  try { return JSON.parse(fm.readString(path)); }
+  catch { return {}; }
+}
+
+function saveWeeklyTrends(trends) {
+  const fm = FileManager.local();
+  const path = fm.joinPath(fm.documentsDirectory(), WEEKLY_KEY + ".json");
+  fm.writeString(path, JSON.stringify(trends));
+}
+
+// Update incremental running averages from a new snapshot
+function updateWeeklyTrends(snap, trends) {
+  const d    = new Date(snap.ts);
+  const dow  = d.getDay();
+  const slot = timeSlotOf(snap.ts);
+  Object.entries(snap.lots).forEach(([zoneId, data]) => {
+    const p   = pct(data.o, data.v);
+    const key = `${dow}_${slot}_${zoneId}`;
+    if (!trends[key]) trends[key] = { sum: 0, count: 0 };
+    trends[key].sum   += p;
+    trends[key].count += 1;
+  });
+  return trends;
+}
+
+// Returns array of { slot, avg } for the given day-of-week and zone
+function getTrendlineForDow(trends, dow, zoneId) {
+  const points = [];
+  for (let slot = 0; slot < 288; slot++) {
+    const key = `${dow}_${slot}_${zoneId}`;
+    if (trends[key] && trends[key].count > 0) {
+      points.push({ slot, avg: Math.round(trends[key].sum / trends[key].count) });
+    }
+  }
+  return points;
 }
 
 function appendSnapshot(data) {
-  const history = loadHistory();
+  const archive = loadArchive();
   const snap = { ts: Date.now(), lots: {} };
   data.forEach(z => {
     if (C_LOTS[z.zone_id] && z.subzone_id === null)
       snap.lots[z.zone_id] = { o: z.occupied, v: z.vacant };
   });
-  history.push(snap);
-  if (history.length > MAX_HISTORY) history.splice(0, history.length - MAX_HISTORY);
-  saveHistory(history);
-  return history;
+  archive.push(snap);
+  saveArchive(archive);
+
+  const trends = loadWeeklyTrends();
+  updateWeeklyTrends(snap, trends);
+  saveWeeklyTrends(trends);
+
+  return archive;
 }
 
 // ── Fetch ────────────────────────────────────────────
@@ -93,14 +160,21 @@ async function fetchParking() {
   return json.Result;
 }
 
-// ── Sparkline ────────────────────────────────────────
-function drawChart(history, zoneId, w, h) {
-  const points = history
+// ── Chart (today's live data + day-of-week trendline) ────────────
+// todayHistory : snapshots from midnight to now (live data line)
+// trends       : weekly trend object from loadWeeklyTrends()
+// zoneId       : lot to chart
+// dow          : day of week (0 = Sunday)
+function drawChart(todayHistory, trends, zoneId, dow, w, h) {
+  // Live points: slot index + occupancy % for today's snapshots
+  const livePts = todayHistory
     .filter(s => s.lots && s.lots[zoneId])
-    .slice(-48)
-    .map(s => { const d = s.lots[zoneId]; return pct(d.o, d.v); });
+    .map(s => ({ slot: timeSlotOf(s.ts), p: pct(s.lots[zoneId].o, s.lots[zoneId].v) }));
 
-  if (points.length < 2) return null;
+  // Historical trendline points for the current day-of-week (full day, 0–287)
+  const trendPts = getTrendlineForDow(trends, dow, zoneId);
+
+  if (livePts.length < 2 && trendPts.length < 2) return null;
 
   const ctx = new DrawContext();
   ctx.size = new Size(w, h);
@@ -111,86 +185,121 @@ function drawChart(history, zoneId, w, h) {
   const cW = w - pad.l - pad.r;
   const cH = h - pad.t - pad.b;
 
+  // X maps a 5-min slot (0–287) across the full day width
+  const xS = slot => pad.l + (slot / 287) * cW;
+  const yS = p    => pad.t + cH - (p / 100 * cH);
+
   // Grid lines
   [25, 50, 75, 100].forEach(v => {
-    const y = pad.t + cH - (v / 100 * cH);
-    const path = new Path();
-    path.move(new Point(pad.l, y));
-    path.addLine(new Point(pad.l + cW, y));
+    const y = yS(v);
+    const gp = new Path();
+    gp.move(new Point(pad.l, y));
+    gp.addLine(new Point(pad.l + cW, y));
     ctx.setStrokeColor(new Color("#2c2c2c"));
     ctx.setLineWidth(0.5);
-    ctx.addPath(path);
+    ctx.addPath(gp);
     ctx.strokePath();
     ctx.setTextColor(new Color("#444444"));
     ctx.setFont(Font.systemFont(7));
     ctx.drawTextInRect(String(v), new Rect(0, y - 5, 24, 10));
   });
 
-  const gX = i => pad.l + (i / (points.length - 1)) * cW;
-  const gY = p => pad.t + cH - (p / 100 * cH);
+  // ── Trendline (dimmed, drawn first so live data sits on top) ──
+  if (trendPts.length >= 2) {
+    const tp = new Path();
+    tp.move(new Point(xS(trendPts[0].slot), yS(trendPts[0].avg)));
+    trendPts.forEach((pt, i) => {
+      if (i > 0) tp.addLine(new Point(xS(pt.slot), yS(pt.avg)));
+    });
+    ctx.setStrokeColor(new Color("#c96a2a", 0.45));
+    ctx.setLineWidth(1.0);
+    ctx.addPath(tp);
+    ctx.strokePath();
+  }
 
-  // Fill
-  const fillPath = new Path();
-  fillPath.move(new Point(gX(0), gY(points[0])));
-  points.forEach((p, i) => { if (i > 0) fillPath.addLine(new Point(gX(i), gY(p))); });
-  fillPath.addLine(new Point(gX(points.length - 1), pad.t + cH));
-  fillPath.addLine(new Point(gX(0), pad.t + cH));
-  fillPath.closeSubpath();
-  ctx.setFillColor(new Color("#c96a2a", 0.15));
-  ctx.addPath(fillPath);
-  ctx.fillPath();
+  // ── Live fill ──
+  if (livePts.length >= 2) {
+    const fp = new Path();
+    fp.move(new Point(xS(livePts[0].slot), yS(livePts[0].p)));
+    livePts.forEach((pt, i) => { if (i > 0) fp.addLine(new Point(xS(pt.slot), yS(pt.p))); });
+    fp.addLine(new Point(xS(livePts[livePts.length - 1].slot), pad.t + cH));
+    fp.addLine(new Point(xS(livePts[0].slot), pad.t + cH));
+    fp.closeSubpath();
+    ctx.setFillColor(new Color("#c96a2a", 0.15));
+    ctx.addPath(fp);
+    ctx.fillPath();
+  }
 
-  // Line
-  const linePath = new Path();
-  linePath.move(new Point(gX(0), gY(points[0])));
-  points.forEach((p, i) => { if (i > 0) linePath.addLine(new Point(gX(i), gY(p))); });
-  ctx.setStrokeColor(new Color("#c96a2a"));
-  ctx.setLineWidth(1.5);
-  ctx.addPath(linePath);
-  ctx.strokePath();
+  // ── Live line ──
+  if (livePts.length >= 2) {
+    const lp = new Path();
+    lp.move(new Point(xS(livePts[0].slot), yS(livePts[0].p)));
+    livePts.forEach((pt, i) => { if (i > 0) lp.addLine(new Point(xS(pt.slot), yS(pt.p))); });
+    ctx.setStrokeColor(new Color("#c96a2a"));
+    ctx.setLineWidth(1.5);
+    ctx.addPath(lp);
+    ctx.strokePath();
+  }
 
-  // End dot
-  const lx = gX(points.length - 1);
-  const ly = gY(points[points.length - 1]);
-  const dotPath = new Path();
-  dotPath.addEllipse(new Rect(lx - 3, ly - 3, 6, 6));
-  ctx.setFillColor(new Color("#c96a2a"));
-  ctx.addPath(dotPath);
-  ctx.fillPath();
+  // ── End dot on live data ──
+  if (livePts.length > 0) {
+    const last = livePts[livePts.length - 1];
+    const dp = new Path();
+    dp.addEllipse(new Rect(xS(last.slot) - 3, yS(last.p) - 3, 6, 6));
+    ctx.setFillColor(new Color("#c96a2a"));
+    ctx.addPath(dp);
+    ctx.fillPath();
+  }
 
-  // Time labels
-  const snaps = history.filter(s => s.lots && s.lots[zoneId]).slice(-48);
+  // Time labels: 12 AM | 12 PM | 11 PM
   ctx.setFont(Font.systemFont(7));
   ctx.setTextColor(new Color("#444444"));
-  if (snaps.length > 0) {
-    ctx.drawTextInRect(fmtTime(new Date(snaps[0].ts)), new Rect(pad.l, h - 13, 36, 12));
-    ctx.drawTextInRect(fmtTime(new Date(snaps[snaps.length - 1].ts)), new Rect(w - 34, h - 13, 36, 12));
-  }
+  ctx.drawTextInRect("12 AM", new Rect(pad.l,              h - 13, 34, 12));
+  ctx.drawTextInRect("12 PM", new Rect(pad.l + cW / 2 - 17, h - 13, 34, 12));
+  ctx.drawTextInRect("11 PM", new Rect(w - 36,             h - 13, 36, 12));
 
   return ctx.getImage();
 }
 
 // ── Widget ───────────────────────────────────────────
+
+// Renders the "chart not ready yet" placeholder
+function addNoChartPlaceholder(widget) {
+  const row = widget.addStack();
+  row.backgroundColor = C.surface;
+  row.cornerRadius = 4;
+  row.setPadding(5, 8, 5, 8);
+  const txt = row.addText("Chart builds after a few refreshes");
+  txt.textColor = C.dimmer;
+  txt.font = Font.systemFont(8);
+}
+
 async function buildWidget() {
   const w = new ListWidget();
   w.backgroundColor = C.bg;
   w.setPadding(14, 14, 12, 14);
   w.refreshAfterDate = new Date(Date.now() + 5 * 60 * 1000);
 
-  let data, history, offline = false;
+  let data, archive, todayHistory, weeklyTrends, offline = false;
 
   try {
-    data    = await fetchParking();
-    history = appendSnapshot(data);
+    data         = await fetchParking();
+    archive      = appendSnapshot(data);
+    weeklyTrends = loadWeeklyTrends();
   } catch {
-    offline = true;
-    history = loadHistory();
-    data    = history.length
-      ? Object.entries(history[history.length - 1].lots).map(([id, d]) => ({
+    offline      = true;
+    archive      = loadArchive();
+    weeklyTrends = loadWeeklyTrends();
+    data         = archive.length
+      ? Object.entries(archive[archive.length - 1].lots).map(([id, d]) => ({
           zone_id: parseInt(id), subzone_id: null, occupied: d.o, vacant: d.v
         }))
       : [];
   }
+
+  todayHistory = getTodayHistory(archive);
+  const now = new Date();
+  const dow = now.getDay();
 
   // ── Header ──
   const hdr = w.addStack();
@@ -231,7 +340,7 @@ async function buildWidget() {
     tTxt.rightAlignText();
   }
 
-  const ptsTxt = timeCol.addText(`${history.length} pts`);
+  const ptsTxt = timeCol.addText(`${todayHistory.length} pts`);
   ptsTxt.textColor = C.dimmer;
   ptsTxt.font = Font.systemFont(7);
   ptsTxt.rightAlignText();
@@ -334,27 +443,23 @@ async function buildWidget() {
   chartSymImg.tintColor = C.dim;
   chartHdr.addSpacer(4);
 
-  const chartLblTxt = chartHdr.addText(`${chartLotName}  ·  last 4 hrs`);
+  const chartLblTxt = chartHdr.addText(`${chartLotName}  ·  ${DAY_NAMES[dow]} today + trend`);
   chartLblTxt.textColor = C.dim;
   chartLblTxt.font = Font.systemFont(8);
 
   w.addSpacer(3);
 
-  if (history.length >= 3) {
-    const chartImg = drawChart(history, chartLotId, 268, 56);
+  if (todayHistory.length >= 2 || Object.keys(weeklyTrends).length > 0) {
+    const chartImg = drawChart(todayHistory, weeklyTrends, chartLotId, dow, 268, 56);
     if (chartImg) {
       const imgEl = w.addImage(chartImg);
       imgEl.resizable = true;
       imgEl.imageSize = new Size(268, 56);
+    } else {
+      addNoChartPlaceholder(w);
     }
   } else {
-    const noChartRow = w.addStack();
-    noChartRow.backgroundColor = C.surface;
-    noChartRow.cornerRadius = 4;
-    noChartRow.setPadding(5, 8, 5, 8);
-    const noTxt = noChartRow.addText("Chart builds after a few refreshes");
-    noTxt.textColor = C.dimmer;
-    noTxt.font = Font.systemFont(8);
+    addNoChartPlaceholder(w);
   }
 
   w.addSpacer(6);
